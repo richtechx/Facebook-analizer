@@ -5,6 +5,7 @@ Flujo: URL de Facebook -> Apify (facebook-comments-scraper) -> Gemini -> JSON co
 
 import logging
 import os
+from datetime import timedelta
 from typing import List
 
 from apify_client import ApifyClientAsync
@@ -67,6 +68,15 @@ class AnalyzeResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Apify: extracción de comentarios
 # ---------------------------------------------------------------------------
+def _field(obj, attr: str, key: str):
+    """Lee un campo tanto si Apify devuelve un dict como un objeto."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, attr, None)
+
+
 async def fetch_comments(url: str) -> List[str]:
     if apify_client is None:
         raise HTTPException(status_code=500, detail="Falta la variable APIFY_API_TOKEN.")
@@ -79,17 +89,26 @@ async def fetch_comments(url: str) -> List[str]:
     }
 
     try:
-        run = await apify_client.actor(APIFY_ACTOR_ID).call(run_input=run_input, timeout_secs=240)
+        run = await apify_client.actor(APIFY_ACTOR_ID).call(
+            run_input=run_input,
+            wait_duration=timedelta(minutes=4),
+        )
     except Exception as exc:
         logger.exception("Error llamando a Apify")
         raise HTTPException(status_code=502, detail=f"Error al ejecutar Apify: {exc}") from exc
 
-    if not run or run.get("status") != "SUCCEEDED":
-        status = run.get("status") if run else "desconocido"
-        raise HTTPException(status_code=502, detail=f"El scraper de Apify no terminó bien (estado: {status}).")
+    # Compatible con apify-client 1.x (dict) y 2.x/3.x (objeto Run)
+    status = _field(run, "status", "status")
+    status = getattr(status, "value", status)
+    if not run or str(status) != "SUCCEEDED":
+        raise HTTPException(
+            status_code=502,
+            detail=f"El scraper de Apify no terminó bien (estado: {status or 'desconocido'}).",
+        )
 
-    dataset = apify_client.dataset(run["defaultDatasetId"])
-    items = (await dataset.list_items()).items
+    dataset_id = _field(run, "default_dataset_id", "defaultDatasetId")
+    page = await apify_client.dataset(dataset_id).list_items()
+    items = page.items or []
 
     comments = [
         item["text"].strip()
