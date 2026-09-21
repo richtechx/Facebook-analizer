@@ -138,11 +138,9 @@ async def analyze_with_gemini(comments: List[str]) -> AnalysisResult:
         logger.exception("Error llamando a Gemini")
         raise HTTPException(status_code=502, detail=f"Error en la API de Gemini: {exc}") from exc
 
-    # El SDK ya convierte el JSON en el modelo Pydantic
     if isinstance(response.parsed, AnalysisResult):
         return response.parsed
 
-    # Respaldo: validar el texto crudo por si parsed viene vacío
     try:
         return AnalysisResult.model_validate_json(response.text or "")
     except Exception as exc:
@@ -179,3 +177,12 @@ async def analyze(req: AnalyzeRequest):
         modelo=GEMINI_MODEL,
         analisis=analysis,
     )
+
+
+# ---------------------------------------------------------------------------
+# Arranque nativo para Render (¡Esto era lo que faltaba!)
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
