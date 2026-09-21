@@ -24,7 +24,7 @@ logger = logging.getLogger("fb-analyzer")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "150"))
 APIFY_ACTOR_ID = "apify/facebook-comments-scraper"
 
