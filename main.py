@@ -178,42 +178,77 @@ async def lead_feedback(email: str, util: Optional[bool], texto: str):
         _write_leads(data)
 
 
-async def systeme_crear_contacto(email: str, nombre: str) -> bool:
-    """Manda el correo a systeme.io. Si falla, solo se registra: el lead ya quedó guardado localmente."""
+async def _systeme_tag_id(client: httpx.AsyncClient) -> Optional[int]:
+    """Acepta el id numérico o el NOMBRE del tag; si es nombre, lo busca en systeme.io."""
+    if not SYSTEME_TAG_ID:
+        return None
+    valor = SYSTEME_TAG_ID.strip()
+    if valor.isdigit():
+        return int(valor)
+    resp = await client.get(f"{SYSTEME_API}/tags", params={"limit": 100})
+    if resp.status_code == 200:
+        for tag in resp.json().get("items", []):
+            if str(tag.get("name", "")).strip().lower() == valor.lower():
+                return int(tag["id"])
+    logger.warning("systeme.io: no encontré el tag '%s' (%s)", valor, resp.status_code)
+    return None
+
+
+async def _systeme_asignar_tag(client: httpx.AsyncClient, contacto_id, tag_id: int) -> tuple:
+    """Prueba el formato numérico y, si lo rechaza, el de texto."""
+    for cuerpo in ({"tagId": tag_id}, {"tagId": str(tag_id)}):
+        resp = await client.post(f"{SYSTEME_API}/contacts/{contacto_id}/tags", json=cuerpo)
+        if resp.status_code in (200, 201, 204):
+            return True, resp.status_code, ""
+        detalle = resp.text[:300]
+    return False, resp.status_code, detalle
+
+
+async def systeme_sync(email: str, nombre: str) -> dict:
+    """Crea el contacto en systeme.io y le aplica el tag. Devuelve un diagnóstico."""
+    info = {"contacto": False, "tag": False, "detalle": ""}
     if not SYSTEME_API_KEY:
-        return False
+        info["detalle"] = "Falta SYSTEME_API_KEY"
+        return info
+
     headers = {"X-API-Key": SYSTEME_API_KEY, "Content-Type": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+        async with httpx.AsyncClient(timeout=20, headers=headers) as client:
             resp = await client.post(
                 f"{SYSTEME_API}/contacts",
                 json={"email": email, "fields": [{"slug": "first_name", "value": nombre}]},
             )
-            contacto_id = None
-            if resp.status_code in (200, 201):
-                contacto_id = resp.json().get("id")
-            else:
-                # Ya existe (o el campo no aplica): lo buscamos por correo
-                logger.info("systeme.io respondió %s al crear, buscando el contacto", resp.status_code)
-                busca = await client.get(f"{SYSTEME_API}/contacts", params={"email": email})
-                if busca.status_code == 200:
-                    items = busca.json().get("items") or []
-                    if items:
-                        contacto_id = items[0].get("id")
+            contacto_id = resp.json().get("id") if resp.status_code in (200, 201) else None
 
             if not contacto_id:
-                logger.warning("systeme.io: no se pudo obtener el contacto de %s (%s)", email, resp.text[:200])
-                return False
+                busca = await client.get(f"{SYSTEME_API}/contacts", params={"email": email})
+                items = busca.json().get("items", []) if busca.status_code == 200 else []
+                if items:
+                    contacto_id = items[0].get("id")
+                else:
+                    info["detalle"] = f"No se pudo crear ni encontrar el contacto ({resp.status_code}): {resp.text[:200]}"
+                    logger.warning("systeme.io: %s", info["detalle"])
+                    return info
 
-            if SYSTEME_TAG_ID:
-                tag = await client.post(f"{SYSTEME_API}/contacts/{contacto_id}/tags",
-                                        json={"tagId": int(SYSTEME_TAG_ID)})
-                if tag.status_code not in (200, 201, 204):
-                    logger.warning("systeme.io: no se pudo aplicar el tag (%s)", tag.status_code)
-            return True
-    except Exception:
+            info["contacto"] = True
+            info["contacto_id"] = contacto_id
+
+            tag_id = await _systeme_tag_id(client)
+            if tag_id is None:
+                info["detalle"] = "Sin tag configurado o nombre no encontrado"
+                return info
+
+            ok, codigo, detalle = await _systeme_asignar_tag(client, contacto_id, tag_id)
+            info["tag"] = ok
+            info["tag_id"] = tag_id
+            if not ok:
+                info["detalle"] = f"El tag falló ({codigo}): {detalle}"
+                logger.warning("systeme.io: %s", info["detalle"])
+            return info
+    except Exception as exc:
+        info["detalle"] = f"Error de conexión: {exc}"
         logger.exception("systeme.io: error enviando el contacto")
-        return False
+        return info
 
 
 def is_guest(user: Optional[str]) -> bool:
@@ -1260,8 +1295,8 @@ async def entrar_invitado(req: GuestRequest, response: Response):
     if lead_usos(email) >= GUEST_LIMIT:
         raise HTTPException(status_code=429, detail=f"Ese correo ya usó sus {GUEST_LIMIT} análisis de prueba.")
     await lead_guardar(email, req.nombre.strip())
-    enviado = await systeme_crear_contacto(email, req.nombre.strip())
-    await lead_marcar_systeme(email, enviado)
+    info = await systeme_sync(email, req.nombre.strip())
+    await lead_marcar_systeme(email, info.get("contacto", False))
     response.set_cookie(
         COOKIE_NAME, signer.dumps(GUEST_PREFIX + email), max_age=SESSION_DAYS * 86400,
         httponly=True, samesite="lax", secure=COOKIE_SECURE,
@@ -1276,6 +1311,16 @@ async def enviar_feedback(req: FeedbackRequest, user: str = Depends(require_user
     else:
         logger.info("Feedback de %s: %s %s", user, req.util, req.texto[:200])
     return {"ok": True}
+
+
+@app.get("/systeme/test")
+async def systeme_test(request: Request, email: str = "prueba@ejemplo.com"):
+    """Diagnóstico: crea un contacto de prueba y dice exactamente qué falló."""
+    user = current_user(request)
+    if not user or is_guest(user):
+        raise HTTPException(status_code=401, detail="Necesitas entrar con tu cuenta.")
+    info = await systeme_sync(email.strip().lower(), "Prueba")
+    return {"tag_configurado": SYSTEME_TAG_ID, **info}
 
 
 @app.get("/leads", response_class=HTMLResponse)
