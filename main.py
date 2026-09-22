@@ -34,6 +34,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-latest")
 MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "150"))          # Facebook
 YT_COMMENTS_PER_VIDEO = int(os.getenv("YT_COMMENTS_PER_VIDEO", "100"))
 MAX_COMMENT_CHARS = 600
@@ -400,30 +401,60 @@ Reglas de evidencia y honestidad:
 - Escribe en el idioma predominante de los comentarios, claro y directo, para un emprendedor que va a tomar una decisión."""
 
 
+RETRYABLE = {429, 500, 503, 504}
+
+
 async def _gemini_json(system: str, user_message: str, schema):
+    """Llama a Gemini con reintentos. Si el modelo principal está saturado, prueba el de respaldo."""
     if gemini_client is None:
         raise HTTPException(status_code=500, detail="Falta la variable GEMINI_API_KEY.")
-    try:
-        response = await gemini_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_message,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                response_mime_type="application/json",
-                response_schema=schema,
-                temperature=0.3,
-            ),
-        )
-    except genai_errors.APIError as exc:
-        logger.exception("Error llamando a Gemini")
-        raise HTTPException(status_code=502, detail=f"Error en la API de Gemini: {exc}") from exc
 
-    if isinstance(response.parsed, schema):
-        return response.parsed
-    try:
-        return schema.model_validate_json(response.text or "")
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Gemini no devolvió un JSON válido: {exc}") from exc
+    config = types.GenerateContentConfig(
+        system_instruction=system,
+        response_mime_type="application/json",
+        response_schema=schema,
+        temperature=0.3,
+    )
+    models = [GEMINI_MODEL] + ([GEMINI_FALLBACK_MODEL] if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL else [])
+    delays = [0, 3, 8]  # segundos de espera antes de cada intento
+    last_exc = None
+
+    for model in models:
+        for delay in delays:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                response = await gemini_client.aio.models.generate_content(
+                    model=model, contents=user_message, config=config,
+                )
+            except genai_errors.APIError as exc:
+                last_exc = exc
+                code = getattr(exc, "code", None)
+                logger.warning("Gemini %s falló (%s). Reintentando...", model, code)
+                if code in RETRYABLE:
+                    continue
+                if code == 404:
+                    break  # modelo no disponible: pasa al de respaldo
+                raise HTTPException(status_code=502, detail=f"Error en la API de Gemini: {exc}") from exc
+
+            if model != GEMINI_MODEL:
+                logger.info("Respuesta obtenida con el modelo de respaldo %s", model)
+            if isinstance(response.parsed, schema):
+                return response.parsed
+            try:
+                return schema.model_validate_json(response.text or "")
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("JSON inválido de %s, reintentando", model)
+                continue
+
+    code = getattr(last_exc, "code", None)
+    if code in RETRYABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini está saturado en este momento (mucha demanda). Espera un par de minutos y vuelve a intentarlo.",
+        )
+    raise HTTPException(status_code=502, detail=f"Error en la API de Gemini: {last_exc}")
 
 
 async def run_analysis(comments: List[str], contexto: str, modo: str, nicho: Optional[str]) -> dict:
